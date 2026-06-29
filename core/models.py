@@ -28,8 +28,17 @@ class Job:
     work_style: str = ""        # 例: "週3〜4日", "フルリモート"
     location: str = ""
     prefecture: str = ""        # 47都道府県のいずれか（検出できた場合）
-    posted_date: str = ""       # ISO8601 もしくは元表記
-    fetched_via: str = "manual"  # "auto" | "chrome" | "manual"
+    posted_date: str = ""       # サイト掲載日（取れた場合）
+    fetched_via: str = "manual"  # "auto" | "chrome" | "browser" | "manual"
+
+    # 観測トラッキング（store が管理）
+    first_seen: str = ""        # fl-cross が初めて観測した日 (YYYY-MM-DD)
+    last_seen: str = ""         # 直近の取得で確認できた日 (YYYY-MM-DD)
+    stale: bool = False         # 最新取得で確認できなかった（受付終了の可能性）
+
+    # ユーザー管理
+    status: str = ""            # "" | "気になる" | "応募済み" | "見送り"
+    notes: str = ""
 
     # 採点結果（scoring が埋める）
     score: Optional[float] = None
