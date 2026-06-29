@@ -159,6 +159,37 @@ _EXTRACTORS: dict[str, str] = {
       return out;
     }}
     """,
+    # FLEXY / サーキュレーションPROポータル（ログイン必須 / 「詳細を見る」起点）
+    "flexy": f"""
+    () => {{
+      const PREF={_PREF_JS}; const out=[]; const seen=new Set();
+      const btns=Array.from(document.querySelectorAll('a,button')).filter(b=>(b.textContent||'').includes('詳細'));
+      for (const b of btns) {{
+        let card=b; for(let i=0;i<8&&card.parentElement;i++){{card=card.parentElement; const tx=card.innerText||''; if(tx.includes('報酬')&&tx.includes('万円')&&tx.length>80) break;}}
+        const text=(card.innerText||'').replace(/\\s+/g,' ').trim();
+        if(!text.includes('万円')||!text.includes('職種')) continue;
+        let t=text.replace(/^(募集中|募集終了|NEW|新着|\\s)+/,'');
+        const cut=t.search(/社名|職種|稼働日数|報酬/);
+        let title=(cut>0?t.slice(0,cut):t.slice(0,60)).trim().slice(0,70);
+        if(!title||title.length<6) continue;
+        const rate=((text.match(/([\\d,]+)\\s*万円/)||[])[1])||'';
+        const week=((text.match(/週\\s*([1-5])/)||[])[1])||'';
+        const remote=/リモート/.test(text);
+        const job=((text.match(/職種[:：]\\s*([^ 社報稼]+)/)||[])[1])||'';
+        const key=title.slice(0,40)+'|'+rate; if(seen.has(key)) continue; seen.add(key);
+        // URL: 詳細ボタン自身のhref優先 → カード内の詳細リンク → 検索ページ
+        let href=(b.tagName==='A'&&b.getAttribute('href'))?b.getAttribute('href'):'';
+        if(!href){{ const a=card.querySelector('a[href*="/projects/"]')||card.querySelector('a[href*="project"]'); href=a?a.getAttribute('href'):''; }}
+        const full=href?(href.startsWith('http')?href:'https://pro.circu.info'+href):'https://pro.circu.info/mypage/projects/search';
+        let pf=''; for(const p of PREF){{ if(text.includes(p)){{pf=p;break;}} }}
+        out.push({{title, url:full, company:'', rate_text: rate?rate+'万円/月':'',
+          work_style:(remote?'リモート ':'')+(week?'週'+week:''), location:pf,
+          description:title+(job?' 職種:'+job:'')}});
+        if(out.length>=30) break;
+      }}
+      return out;
+    }}
+    """,
     # ランサーズ（サーバー描画。汎用に近い抽出）
     "lancers": f"""
     () => {{
@@ -183,7 +214,7 @@ _EXTRACTORS: dict[str, str] = {
 }
 
 # スクロールが必要なサイト（遅延ロード）
-_NEEDS_SCROLL = {"findy", "freelance_board", "crowdworks_tech"}
+_NEEDS_SCROLL = {"findy", "freelance_board", "crowdworks_tech", "flexy"}
 
 
 def _is_playwright_available() -> bool:
@@ -254,8 +285,9 @@ def open_for_login(keys: Optional[list[str]] = None) -> None:
         "levtech": "https://freelance.levtech.jp/",
         "findy": "https://freelance.findy-code.io/",
         "freelance_hub": "https://freelance-hub.jp/",
+        "flexy": "https://pro.circu.info/login",
     }
-    keys = keys or ["levtech", "findy"]
+    keys = keys or ["levtech", "findy", "flexy"]
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
