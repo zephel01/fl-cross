@@ -73,3 +73,5 @@ enabled = true
 enabled = true
 [agents.pebank]
 enabled = true
+[agents.flexy]
+enabled = true
