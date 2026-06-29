@@ -1,0 +1,38 @@
+[
+  {
+    "title": "生成AIエージェント基盤(MCP/tool calling)の設計・開発",
+    "company": "AIスタートアップA社",
+    "url": "https://example.com/job/ai-agent-1",
+    "rate_text": "〜120万円/月",
+    "work_style": "フルリモート 週4",
+    "description": "Claude/OpenAIを用いたマルチエージェント基盤の開発。MCP, tool calling, RAG, Python, Docker。LLMOps経験歓迎。",
+    "posted_date": "2026-06-27"
+  },
+  {
+    "title": "ローカルLLM(vLLM/Ollama)推論基盤の構築・最適化",
+    "company": "製造業B社",
+    "url": "https://example.com/job/local-llm-2",
+    "rate_text": "9,000円/時 〜 13,000円/時",
+    "work_style": "フルリモート 週3",
+    "description": "オンプレGPUでのvLLM/Ollama推論基盤構築。CUDA最適化、量子化・蒸留、セキュリティ要件あり。Python, Kubernetes。",
+    "posted_date": "2026-06-28"
+  },
+  {
+    "title": "PHPでの社内基幹システム保守(常駐)",
+    "company": "SIerC社",
+    "url": "https://example.com/job/php-legacy-3",
+    "rate_text": "60万円/月",
+    "work_style": "常駐 週5 出社",
+    "description": "レガシーPHPシステムの保守運用。出社必須。残業多め。",
+    "posted_date": "2026-05-10"
+  },
+  {
+    "title": "RAGチャットボットのプロンプト改善(短期)",
+    "company": "EC D社",
+    "url": "https://example.com/job/rag-4",
+    "rate_text": "5,000円/時",
+    "work_style": "リモート 週2",
+    "description": "既存RAGチャットボットの精度改善。LangChain, OpenAI。生成AIの知見必須。",
+    "posted_date": "2026-06-20"
+  }
+]

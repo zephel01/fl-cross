@@ -1,0 +1,9 @@
+streamlit>=1.30
+httpx>=0.27
+beautifulsoup4>=4.12
+tomli>=2.0; python_version < "3.11"
+# 任意: 全サイト自動取得（SPA/ログイン必須サイト）に使う
+#   インストール後: playwright install chromium
+playwright>=1.40
+# 任意: ローカルLLM深掘り分析を使う場合（httpx直叩きでも動くため必須ではない）
+ollama>=0.3

@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# 個人設定・実データ（コミットしない）
+config.toml
+data/jobs.json
+.fl-cross/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,64 @@
+# fl-cross v2 設定サンプル
+# 使い方: このファイルを config.toml にコピーして自分用に編集してください。
+#   cp config.example.toml config.toml
+# config.toml は .gitignore 済み（個人設定はコミットされません）。
+
+[profile]
+name = "Your Name"
+# あなたの強み（マッチ率算出やLLM深掘りの前提として使われます）
+strong_skills = [
+    "（例）バックエンド開発 (Python / Go / API設計)",
+    "（例）クラウドインフラ (AWS / Docker / Kubernetes)",
+    "（例）フロントエンド (TypeScript / React)",
+    "（例）データ / 機械学習 (SQL / 生成AI / RAG)",
+]
+# マッチ率算出に使うキーワード（自分の得意分野に合わせて編集）
+match_keywords = [
+    "AI", "LLM", "エージェント", "agent", "生成AI", "RAG",
+    "Python", "TypeScript", "Go", "React", "AWS", "Docker",
+    "Kubernetes", "インフラ", "バックエンド", "MLOps",
+]
+target_rate_min = 6000       # 円/時間 下限
+target_rate_max = 12000      # 円/時間 上限
+target_monthly_min = 600000  # 月額換算の目安（下限）
+target_monthly_max = 1200000 # 月額換算の目安（上限）
+preferred_remote = true      # フルリモート希望
+preferred_work_style = "フルリモート or 週3〜4日"
+location = "東京"
+
+[llm]
+# "ollama"      : ローカルOllamaで深掘り分析
+# "prompt-only" : プロンプトだけ出力（手動でClaude等に投げる）
+provider = "ollama"
+model = "qwen2.5:7b"         # 例: qwen2.5:7b / qwen2.5:32b / llama3.1 など
+base_url = "http://localhost:11434"
+timeout = 180
+
+[scoring]
+# ルール採点の重み（合計100目安）
+weight_keyword = 45      # スキルキーワードの重なり
+weight_rate = 25         # 単価レンジ適合
+weight_remote = 15       # リモート/働き方適合
+weight_freshness = 15    # 新着度
+
+[filters]
+# 取得元サイトに関わらず、ここに挙げた「提供元(provider)」の案件を横断除外する。
+# 例: exclude_providers = ["レバテックフリーランス"]
+exclude_providers = []
+
+# ============================================================
+# エージェント（検索先）の有効・無効
+# enabled = false で取得・採点・表示すべてから除外
+# ============================================================
+[agents.freelance_hub]
+enabled = true
+[agents.levtech]
+enabled = true
+[agents.findy]
+enabled = true
+[agents.crowdworks_tech]
+enabled = true
+[agents.lancers]
+enabled = true
+[agents.freelance_board]
+enabled = true
