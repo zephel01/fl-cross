@@ -45,6 +45,9 @@ weight_freshness = 15    # 新着度
 # 取得元サイトに関わらず、ここに挙げた「提供元(provider)」の案件を横断除外する。
 # 例: exclude_providers = ["レバテックフリーランス"]
 exclude_providers = []
+# ブラックリスト：タイトル・社名・本文・提供元にこれらの語を含む案件を除外
+# 例: ng_words = ["常駐", "派遣", "アダルト"]
+ng_words = []
 
 # ============================================================
 # エージェント（検索先）の有効・無効
@@ -61,4 +64,12 @@ enabled = true
 [agents.lancers]
 enabled = true
 [agents.freelance_board]
+enabled = true
+[agents.itpropartners]
+enabled = true
+[agents.midworks]
+enabled = true
+[agents.techfree]
+enabled = true
+[agents.pebank]
 enabled = true

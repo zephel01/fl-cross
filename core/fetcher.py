@@ -51,6 +51,24 @@ def _soup(html: str):
     return BeautifulSoup(html, "html.parser")
 
 
+def fetch_detail_text(url: str, limit: int = 4000) -> str:
+    """案件詳細ページの本文テキストをベストエフォートで取得（一括LLM分析の補強用）。"""
+    if not url or not url.startswith("http"):
+        return ""
+    html = _get_html(url)
+    if not html:
+        return ""
+    try:
+        soup = _soup(html)
+        for tag in soup(["script", "style", "nav", "header", "footer"]):
+            tag.decompose()
+        main = soup.find("main") or soup.find("article") or soup.body
+        text = (main.get_text(" ", strip=True) if main else soup.get_text(" ", strip=True))
+        return text[:limit]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 # ------------------------------------------------------------------
 # 汎用パーサ：案件リンクらしき <a> を見出しとして拾う
 # ------------------------------------------------------------------
@@ -104,8 +122,82 @@ def _generic_parse(html: str, source: Source, limit: int = 40) -> list[dict[str,
     return records
 
 
-# サイト別パーサ（必要に応じ精緻化。未実装は汎用にフォールバック）
-PARSERS: dict[str, Callable[[str, Source], list[dict[str, Any]]]] = {}
+def _card_parse(html: str, source: Source, link_re: str, *, title_from_heading: bool = False,
+                limit: int = 40) -> list[dict[str, Any]]:
+    """詳細リンク起点でカードを特定し title/rate/work_style を抽出する共通パーサ。"""
+    import re as _re
+    soup = _soup(html)
+    YEN = _re.compile(r"[\d,]+\s*万?\s*円")
+    pat = _re.compile(link_re)
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not pat.search(href):
+            continue
+        m = _re.search(r"(\d{2,})", href)
+        if not m:
+            continue
+        cid = m.group(1)
+        if cid in seen:
+            continue
+        card = a
+        for _ in range(8):
+            if card.parent is None:
+                break
+            card = card.parent
+            if "円" in card.get_text():
+                break
+        text = card.get_text(" ", strip=True)
+        if "円" not in text:
+            continue
+        title = a.get_text(strip=True)
+        if title_from_heading or len(title) < 6:
+            h = card.find(["h1", "h2", "h3", "h4"]) or card.find(class_=_re.compile("title|name|ttl", _re.I))
+            if h:
+                title = h.get_text(strip=True)
+        if len(title) < 6:
+            continue
+        rate_m = YEN.search(text)
+        full = href if href.startswith("http") else source.base_url.rstrip("/") + "/" + href.lstrip("/")
+        remote = "リモート" in text or "在宅" in text
+        week_m = _re.search(r"週\s*([1-5])", text)
+        seen.add(cid)
+        records.append({
+            "title": title[:110],
+            "url": full,
+            "rate_text": rate_m.group(0) if rate_m else "",
+            "work_style": ("リモート " if remote else "") + (f"週{week_m.group(1)}" if week_m else ""),
+            "description": (title + " / " + text[:160]),
+        })
+        if len(records) >= limit:
+            break
+    return records
+
+
+def _p_itpropartners(html: str, s: Source):
+    return _card_parse(html, s, r"/detail/\d")
+
+
+def _p_midworks(html: str, s: Source):
+    return _card_parse(html, s, r"/projects/\d", title_from_heading=True)
+
+
+def _p_techfree(html: str, s: Source):
+    return _card_parse(html, s, r"/detail/\d")
+
+
+def _p_pebank(html: str, s: Source):
+    return _card_parse(html, s, r"/(java|other|sap|infra|php|python|ruby|web|network|pm|cloud|mobile|sier|game|ai)/\d")
+
+
+# サイト別パーサ（未登録キーは汎用にフォールバック）
+PARSERS: dict[str, Callable[[str, Source], list[dict[str, Any]]]] = {
+    "itpropartners": _p_itpropartners,
+    "midworks": _p_midworks,
+    "techfree": _p_techfree,
+    "pebank": _p_pebank,
+}
 
 
 def fetch_source(source: Source, keywords: list[str]) -> FetchResult:

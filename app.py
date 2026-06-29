@@ -6,22 +6,27 @@
     pip install -r requirements.txt
     streamlit run app.py
 
-機能:
-  - サイドバー: エージェント(検索先)の有効/無効トグル + フィルタ
-  - 横断取得(自動 / Chrome連携JSON / 手動) -> 統一スキーマ
-  - ハイブリッド・マッチ率(ルール) で降順表示
-  - 各案件を Ollama で深掘り分析
+構成:
+  - サイドバー: よく使う操作（キーワード/並び替え/ステータス/マッチ率/リモート/稼働日数/取得）
+  - タブ: 案件一覧 / 絞り込み詳細 / 設定 / 取り込み / 使い方
 """
 from __future__ import annotations
 
 import json
+import subprocess
+import sys as _sys
+from datetime import date
 from pathlib import Path
 
 import streamlit as st
 
-from core.config import load_config, save_agent_toggles, save_exclude_providers
+from core.config import (
+    load_config, save_agent_toggles, save_exclude_providers, save_ng_words,
+    save_scoring_weights, save_llm_config,
+)
 from core.sources import SOURCES, SOURCE_BY_KEY, all_toggles, enabled_sources
-from core import store, scoring, fetcher, ingest
+from core import store, scoring, fetcher, ingest, dedup
+from core import browser_fetch as _bf
 from core.providers import job_provider
 from core.areas import (
     REGIONS, REMOTE_FULL, REMOTE_PARTIAL, REMOTE_GENERIC, ONSITE, UNKNOWN,
@@ -31,337 +36,273 @@ from core.workdays import days_set, days_label
 
 st.set_page_config(page_title="fl-cross v2", page_icon="🧭", layout="wide")
 
-# ------------------------------------------------------------------
-# 設定ロード（セッションで保持）
-# ------------------------------------------------------------------
 if "config" not in st.session_state:
     st.session_state.config = load_config()
 config = st.session_state.config
 profile = config.get("profile", {})
 
 DEFAULT_KEYWORDS = ["AI", "LLM", "エージェント", "ローカルLLM", "Claude", "vLLM", "Ollama", "インフラ"]
+STATUS_OPTIONS = ["未対応", "気になる", "応募済み", "見送り"]
+STATUS_BADGE = {"気になる": "⭐", "応募済み": "✅", "見送り": "🚫"}
+
+
+# ------------------------------------------------------------------
+# ヘルパー
+# ------------------------------------------------------------------
+def _days_ago(iso: str):
+    if not iso:
+        return None
+    try:
+        d = date.fromisoformat(iso[:10])
+    except ValueError:
+        return None
+    return (date.today() - d).days
+
+
+def _job_status(j) -> str:
+    return j.status or "未対応"
+
+
+def _set_status(job_id: str, status: str) -> None:
+    allj = store.load_jobs()
+    for x in allj:
+        if x.id == job_id:
+            x.status = "" if status == "未対応" else status
+    store.save_jobs(allj)
+
+
+def _set_notes(job_id: str, notes: str) -> None:
+    allj = store.load_jobs()
+    for x in allj:
+        if x.id == job_id:
+            x.notes = notes
+    store.save_jobs(allj)
+
+
+def _monthly(j) -> int:
+    if j.rate_monthly_max or j.rate_monthly_min:
+        return j.rate_monthly_max or j.rate_monthly_min
+    if j.rate_hourly_max or j.rate_hourly_min:
+        return (j.rate_hourly_max or j.rate_hourly_min) * 160
+    return 0
+
 
 # ==================================================================
-# サイドバー
+# サイドバー（よく使う操作）
 # ==================================================================
 st.sidebar.title("🧭 fl-cross v2")
 st.sidebar.caption(f"{profile.get('name','')} 向け横断ダッシュボード")
 
-st.sidebar.subheader("検索先エージェント")
-st.sidebar.caption("ON のサイトだけ取得・採点・表示されます")
-toggles = all_toggles(config)
-new_toggles = {}
-for s in sorted(SOURCES, key=lambda x: x.priority):
-    label = f"{s.name}  ·  {s.type}"
-    new_toggles[s.key] = st.sidebar.checkbox(
-        label, value=toggles[s.key], key=f"tg_{s.key}",
-        help=(s.note + ("  ⚠ログイン/SPA: Chrome連携推奨" if s.login_required else "")),
-    )
-if new_toggles != toggles:
-    # config(セッション) に反映 + ファイルへ保存
-    config.setdefault("agents", {})
-    for k, v in new_toggles.items():
-        config["agents"].setdefault(k, {})["enabled"] = v
-    try:
-        save_agent_toggles(new_toggles)
-    except Exception as e:  # noqa: BLE001
-        st.sidebar.warning(f"設定保存に失敗: {e}")
-
-# --- 提供元(provider)で横断除外 ---
-st.sidebar.divider()
-st.sidebar.subheader("提供元で除外")
-st.sidebar.caption("取得元サイトに関わらず、提供元単位で除外（例: フリーランスHub経由のレバテック案件も消す）")
-_jobs_for_prov = store.load_jobs()
-providers_present = sorted({job_provider(j) for j in _jobs_for_prov if job_provider(j)})
-current_excl = set(config.get("filters", {}).get("exclude_providers", []))
-new_excl: set[str] = set()
-if providers_present:
-    with st.sidebar.expander(f"提供元 {len(providers_present)}件", expanded=bool(current_excl)):
-        for p in providers_present:
-            if st.checkbox(f"除外: {p}", value=(p in current_excl), key=f"excl_{p}"):
-                new_excl.add(p)
-    # 取得前から config に入っていて今は未取得の提供元も保持
-    for p in current_excl:
-        if p not in providers_present:
-            new_excl.add(p)
-else:
-    st.sidebar.caption("（案件を取得すると提供元の一覧が出ます）")
-    new_excl = set(current_excl)
-if new_excl != current_excl:
-    config.setdefault("filters", {})["exclude_providers"] = sorted(new_excl)
-    try:
-        save_exclude_providers(sorted(new_excl))
-    except Exception as e:  # noqa: BLE001
-        st.sidebar.warning(f"設定保存に失敗: {e}")
-exclude_providers = set(config.get("filters", {}).get("exclude_providers", []))
-
-st.sidebar.divider()
-st.sidebar.subheader("フィルタ")
-kw_text = st.sidebar.text_input("検索キーワード(スペース区切り)", value=" ".join(DEFAULT_KEYWORDS))
+kw_text = st.sidebar.text_input("🔎 検索キーワード(スペース区切り)", value=" ".join(DEFAULT_KEYWORDS))
 keywords = [k for k in kw_text.split() if k]
+
+SORT_OPTIONS = [
+    "マッチ率（高い順）", "単価（高い順）", "単価（低い順）",
+    "新着順（初観測）", "取得元（エージェント）別", "提供元別",
+]
+sort_opt = st.sidebar.selectbox("並び替え", SORT_OPTIONS, index=0)
+
+status_filter = st.sidebar.multiselect(
+    "ステータス絞り込み", STATUS_OPTIONS, default=["未対応", "気になる", "応募済み"],
+    help="見送りは既定で非表示。気になるだけ表示などに使えます。",
+)
+status_set = set(status_filter)
+
 min_score = st.sidebar.slider("マッチ率の下限", 0, 100, 0, 5)
 
-# --- リモート区分フィルタ ---
 REMOTE_OPTIONS = [REMOTE_FULL, REMOTE_PARTIAL, REMOTE_GENERIC, ONSITE, UNKNOWN]
 remote_sel = st.sidebar.multiselect(
     "リモート区分", REMOTE_OPTIONS, default=[REMOTE_FULL, REMOTE_PARTIAL, REMOTE_GENERIC],
-    help="フルリモート / 一部リモート / リモート(区分不明) / 常駐 / 不明 から選択",
 )
 remote_set = set(remote_sel)
 
-# --- 稼働日数(週何日)フィルタ ---
 days_sel = st.sidebar.multiselect(
-    "稼働日数(週)", [1, 2, 3, 4, 5], default=[],
-    format_func=lambda d: f"週{d}日",
-    help="選んだ日数で働ける案件のみ表示（例: 週3 を選ぶと 週3〜5 などの範囲案件もヒット）。未選択なら全件。",
+    "稼働日数(週)", [1, 2, 3, 4, 5], default=[], format_func=lambda d: f"週{d}日",
+    help="週3を選ぶと『週3〜5』など範囲案件もヒット。未選択なら全件。",
 )
 days_filter = set(days_sel)
-include_unknown_days = st.sidebar.checkbox(
-    "稼働日数 不明も含める", value=True, help="週数の記載がない案件も表示する",
-) if days_filter else True
+include_unknown_days = st.sidebar.checkbox("稼働日数 不明も含める", value=True) if days_filter else True
 
-# --- エリア(47都道府県)フィルタ ---
-with st.sidebar.expander("エリア(47都道府県)で絞り込み"):
-    st.caption("未選択なら全国。地方ごとにまとめて選べます。")
-    pref_sel: list[str] = []
-    for region, prefs in REGIONS.items():
-        picked = st.multiselect(region, prefs, default=[], key=f"pref_{region}")
-        pref_sel.extend(picked)
-    include_unknown_area = st.checkbox("地域不明・記載なしも含める", value=True,
-                                       help="リモート案件は勤務地未記載が多いため既定でON")
-pref_set = set(pref_sel)
+hide_stale = st.sidebar.checkbox("受付終了の可能性(古い/消失)を隠す", value=False,
+                                 help="最新取得で確認できなかった案件を非表示")
+dedup_on = st.sidebar.checkbox("重複を名寄せ（一次ソース優先）", value=False,
+                               help="アグリゲーター経由の同一案件をまとめ、直エージェントを代表に。中で各ソースの単価を比較")
 
-min_hourly = st.sidebar.number_input(
-    "最低時給(円, 0=無視)", min_value=0, max_value=30000, value=0, step=500,
-)
-
-# --- LLM設定（深掘り分析） ---
-st.sidebar.divider()
-st.sidebar.subheader("LLM設定（深掘り分析）")
-llm_cfg = config.setdefault("llm", {})
-provider = st.sidebar.selectbox(
-    "推論方法", ["ollama", "prompt-only"],
-    index=0 if llm_cfg.get("provider", "ollama") == "ollama" else 1,
-    help="ollama=ローカルLLMで分析 / prompt-only=プロンプトだけ出力（手動でClaude等へ）",
-)
-llm_cfg["provider"] = provider
-base_url = st.sidebar.text_input("Ollama base_url", value=llm_cfg.get("base_url", "http://localhost:11434"))
-llm_cfg["base_url"] = base_url
-llm_cfg["timeout"] = st.sidebar.number_input("タイムアウト(秒)", 10, 600, int(llm_cfg.get("timeout", 180)), 10)
-
-if st.sidebar.button("🔌 接続テスト / モデル一覧", use_container_width=True):
-    st.session_state.llm_diag = scoring.ollama_diagnose(config)
-diag = st.session_state.get("llm_diag")
-_models = diag["models"] if diag else []
-if diag:
-    (st.sidebar.success if diag["ok"] else st.sidebar.error)(diag["message"])
-
-# モデル選択（接続できていれば一覧から、なければ手入力）
-cur_model = llm_cfg.get("model", "qwen2.5:32b")
-if _models:
-    idx = _models.index(cur_model) if cur_model in _models else 0
-    llm_cfg["model"] = st.sidebar.selectbox("モデル", _models, index=idx)
-else:
-    llm_cfg["model"] = st.sidebar.text_input("モデル名", value=cur_model,
-                                             help="接続テストを押すと一覧から選べます")
-
+# --- 取得 ---
 st.sidebar.divider()
 st.sidebar.subheader("取得")
-
-# --- ブラウザ自動取得（Playwright：全サイト対応） ---
-import subprocess, sys as _sys
-from pathlib import Path as _Path
-from core import browser_fetch as _bf
-
 pw_ok = _bf._is_playwright_available()
-if st.sidebar.button("🌐 全サイト自動取得（ブラウザ）", use_container_width=True,
-                     disabled=not pw_ok,
-                     help="Playwrightで全有効サイト(SPA/ログイン含む)を取得。要ログインサイトは事前に下のログインが必要"):
+if st.sidebar.button("🌐 全サイト自動取得（ブラウザ）", use_container_width=True, disabled=not pw_ok,
+                     help="Playwrightで全有効サイト(SPA/ログイン含む)を取得"):
     with st.spinner("ブラウザで全サイト取得中…（30〜90秒）"):
-        proc = subprocess.run(
-            [_sys.executable, "fetch_browser.py", "--keywords", *keywords],
-            cwd=str(_Path(__file__).parent), capture_output=True, text=True, timeout=600,
-        )
+        proc = subprocess.run([_sys.executable, "fetch_browser.py", "--keywords", *keywords],
+                              cwd=str(Path(__file__).parent), capture_output=True, text=True, timeout=600)
     st.session_state.browser_log = (proc.stdout or "") + (proc.stderr or "")
     st.rerun()
-
 if not pw_ok:
     st.sidebar.caption("⚠ ブラウザ取得には Playwright が必要:\n`pip install playwright && playwright install chromium`")
 else:
-    profile_exists = (_Path.home() / ".fl-cross" / "pw-profile").exists()
-    st.sidebar.caption(
-        ("🔑 ログイン必須サイト(Findy/レバテック)は初回のみターミナルで:\n"
-         "`python fetch_browser.py --login`\n"
-         + ("（ログインプロファイル: 設定済み）" if profile_exists else "（未ログイン）"))
-    )
-if st.session_state.get("browser_log"):
-    with st.sidebar.expander("ブラウザ取得ログ"):
-        st.code(st.session_state["browser_log"][-2000:])
-
-# --- httpx自動取得（軽量：サーバー描画サイトのみ） ---
+    _prof = (Path.home() / ".fl-cross" / "pw-profile").exists()
+    st.sidebar.caption("🔑 要ログインサイトは初回のみ:\n`python fetch_browser.py --login`\n"
+                       + ("（ログイン: 設定済み）" if _prof else "（未ログイン）"))
 if st.sidebar.button("🔄 httpx自動取得（軽量）", use_container_width=True,
-                     help="ランサーズ・フリーランスボード等のサーバー描画サイトのみ。ブラウザ不要"):
-    with st.spinner("取得中（ベストエフォート）..."):
+                     help="サーバー描画サイトのみ。ブラウザ不要"):
+    with st.spinner("取得中..."):
         results = fetcher.fetch_all(config, keywords)
-        total_added = total_updated = 0
+        ta = tu = 0
         msgs = []
         for r in results:
             if r.jobs:
                 a, u = store.upsert_jobs(r.jobs)
-                total_added += a
-                total_updated += u
+                ta += a
+                tu += u
             msgs.append(f"- {r.source.name}: {r.message}")
         st.session_state.fetch_report = msgs
-        st.session_state.fetch_summary = f"新規 {total_added} / 更新 {total_updated}"
+        st.session_state.fetch_summary = f"新規 {ta} / 更新 {tu}"
     st.rerun()
-
 if "fetch_summary" in st.session_state:
     st.sidebar.success(st.session_state.fetch_summary)
-    with st.sidebar.expander("httpx取得ログ"):
+    with st.sidebar.expander("取得ログ"):
         st.markdown("\n".join(st.session_state.get("fetch_report", [])))
+        if st.session_state.get("browser_log"):
+            st.code(st.session_state["browser_log"][-1500:])
 
 # ==================================================================
-# メイン
+# タブ（案件一覧 / 絞り込み詳細 / 設定 / 取り込み / 使い方）
 # ==================================================================
 st.title("横断案件ダッシュボード")
-
-active = enabled_sources(config)
-st.caption(
-    "有効エージェント: " + (", ".join(s.name for s in active) if active else "なし") +
-    f"  ／  キーワード: {' '.join(keywords) if keywords else '(なし)'}"
+tab_jobs, tab_summary, tab_filter, tab_settings, tab_import, tab_help = st.tabs(
+    ["📋 案件一覧", "📊 サマリー", "🎛 絞り込み詳細", "⚙️ 設定", "📥 取り込み", "ℹ️ 使い方"]
 )
 
-tab_jobs, tab_import, tab_help = st.tabs(["📋 案件一覧", "📥 取り込み(Chrome連携/手動)", "ℹ️ 使い方"])
+# ---------------- 絞り込み詳細（先に評価して変数を確定） ----------------
+with tab_filter:
+    st.subheader("NGワード（ブラックリスト）")
+    st.caption("タイトル・社名・本文・提供元にこれらの語を含む案件を除外します（1行または半角/全角スペース・カンマ区切り）。")
+    cur_ng = config.get("filters", {}).get("ng_words", [])
+    ng_text = st.text_area("NGワード", value="\n".join(cur_ng), height=120,
+                           placeholder="常駐\n派遣\nアダルト\n株式会社○○")
+    ng_words = [w.strip() for w in ng_text.replace("、", "\n").replace(",", "\n").split() if w.strip()]
+    if set(ng_words) != set(cur_ng):
+        config.setdefault("filters", {})["ng_words"] = ng_words
+        try:
+            save_ng_words(ng_words)
+        except Exception as e:  # noqa: BLE001
+            st.warning(f"保存に失敗: {e}")
 
-# ---------------- 案件一覧 ----------------
-with tab_jobs:
-    jobs = store.load_jobs()
-    # 有効エージェント(取得元サイト)のみ
-    active_keys = {s.key for s in active}
-    jobs = [j for j in jobs if j.source in active_keys]
-    # 提供元(provider)除外（取得元に関わらず横断で消す）
-    excluded_count = sum(1 for j in jobs if job_provider(j) in exclude_providers)
-    jobs = [j for j in jobs if job_provider(j) not in exclude_providers]
-    # 採点
-    jobs = scoring.score_jobs(jobs, config)
-    if exclude_providers:
-        st.caption("除外中の提供元: " + ", ".join(sorted(exclude_providers)) + f"（{excluded_count}件を非表示）")
-    # フィルタ
-    def _passes(j):
-        if (j.score or 0) < min_score:
-            return False
-        # リモート区分
-        if remote_set and job_remote_level(j) not in remote_set:
-            return False
-        # 稼働日数(週)
-        if days_filter:
-            ds = days_set(j)
-            if ds:
-                if not (ds & days_filter):
-                    return False
-            elif not include_unknown_days:
-                return False
-        # エリア(都道府県)
-        if pref_set:
-            pf = job_prefecture(j)
-            if pf:
-                if pf not in pref_set:
-                    return False
-            else:
-                if not include_unknown_area:
-                    return False
-        if min_hourly:
-            hi = j.rate_hourly_max or ((j.rate_monthly_max or 0) // 160)
-            if hi and hi < min_hourly:
-                return False
-        return True
-    shown = [j for j in jobs if _passes(j)]
+    st.divider()
+    st.subheader("提供元で除外（ブラックリスト）")
+    st.caption("config.toml に保存され、取得データに依存しません。1行1件、または半角/全角スペース・カンマ区切り。")
+    cur_excl = config.get("filters", {}).get("exclude_providers", [])
+    excl_text = st.text_area("除外する提供元/社名", value="\n".join(cur_excl), height=110,
+                             placeholder="レバテックフリーランス\n株式会社○○")
+    new_excl = [w.strip() for w in excl_text.replace("、", "\n").replace(",", "\n").splitlines() if w.strip()]
+    if set(new_excl) != set(cur_excl):
+        config.setdefault("filters", {})["exclude_providers"] = new_excl
+        try:
+            save_exclude_providers(new_excl)
+        except Exception as e:  # noqa: BLE001
+            st.warning(f"保存に失敗: {e}")
+    exclude_providers = set(config.get("filters", {}).get("exclude_providers", []))
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("表示件数", len(shown))
-    c2.metric("全件(有効サイト)", len(jobs))
-    c3.metric("平均マッチ率", f"{(sum(j.score or 0 for j in shown)/len(shown)):.0f}" if shown else "—")
+    # 参考：いまデータに在る提供元（クリックで上の欄にコピペしやすいよう列挙）
+    _present = sorted({job_provider(j) for j in store.load_jobs() if job_provider(j)})
+    if _present:
+        st.caption("データにある提供元（参考）: " + " / ".join(_present))
 
-    if not shown:
-        st.info("該当案件がありません。サイドバーで自動取得するか、「取り込み」タブからChrome連携/手動で案件を追加してください。")
-    for j in shown:
-        score = j.score or 0
-        color = "🟢" if score >= 70 else ("🟡" if score >= 45 else "⚪")
-        prov = job_provider(j)
-        rate_disp = j.rate_text or "単価記載なし"
-        header = f"{color} **{score:.0f}%**  ｜ 💰 **{rate_disp}**  ｜ {j.title}  ｜ 取得元:_{j.source_name}_ / 提供元:_{prov or '—'}_"
-        with st.expander(header):
-            meta = []
-            if prov:
-                meta.append(f"提供元: {prov}")
-            if j.rate_text:
-                meta.append(f"単価: {j.rate_text}")
-            if j.work_style:
-                meta.append(f"働き方: {j.work_style}")
-            meta.append(f"リモート区分: {job_remote_level(j)}")
-            meta.append(f"稼働日数: {days_label(j)}")
-            _pf = job_prefecture(j)
-            meta.append(f"エリア: {_pf or '不明/記載なし'}")
-            if j.posted_date:
-                meta.append(f"掲載: {j.posted_date}")
-            st.caption("　｜　".join(meta) if meta else "")
+    st.divider()
+    st.subheader("エリア（47都道府県）")
+    st.caption("未選択なら全国。地方ごとに選べます。")
+    pref_sel: list[str] = []
+    rcols = st.columns(2)
+    for i, (region, prefs) in enumerate(REGIONS.items()):
+        picked = rcols[i % 2].multiselect(region, prefs, default=[], key=f"pref_{region}")
+        pref_sel.extend(picked)
+    include_unknown_area = st.checkbox("地域不明・記載なしも含める", value=True)
+    pref_set = set(pref_sel)
 
-            bd = j.score_breakdown or {}
-            if bd:
-                bc = st.columns(4)
-                bc[0].metric("KW一致", f"{bd.get('keyword',0):.0f}")
-                bc[1].metric("単価", f"{bd.get('rate',0):.0f}")
-                bc[2].metric("リモート", f"{bd.get('remote',0):.0f}")
-                bc[3].metric("新着", f"{bd.get('freshness',0):.0f}")
+    st.divider()
+    min_hourly = st.number_input("最低時給(円, 0=無視)", min_value=0, max_value=30000, value=0, step=500)
 
-            if j.skills:
-                st.write("スキル: " + ", ".join(j.skills))
-            if j.url:
-                st.markdown(f"[案件ページを開く ↗]({j.url})")
-            if j.description:
-                with st.expander("案件説明"):
-                    st.write(j.description[:4000])
+# ---------------- 設定（エージェントON/OFF・LLM） ----------------
+with tab_settings:
+    st.subheader("検索先エージェント（取得元）")
+    st.caption("ON のサイトだけ取得・採点・表示されます。")
+    toggles = all_toggles(config)
+    new_toggles = {}
+    scols = st.columns(2)
+    for i, s in enumerate(sorted(SOURCES, key=lambda x: x.priority)):
+        new_toggles[s.key] = scols[i % 2].checkbox(
+            f"{s.name}（{s.type}）", value=toggles[s.key], key=f"tg_{s.key}",
+            help=s.note,
+        )
+    if new_toggles != toggles:
+        config.setdefault("agents", {})
+        for k, v in new_toggles.items():
+            config["agents"].setdefault(k, {})["enabled"] = v
+        try:
+            save_agent_toggles(new_toggles)
+        except Exception as e:  # noqa: BLE001
+            st.warning(f"保存に失敗: {e}")
 
-            mdl = config.get("llm", {}).get("model", "")
-            if st.button(f"🤖 LLM深掘り分析（{mdl or 'モデル未設定'}）", key=f"llm_{j.id}"):
-                with st.spinner(f"{mdl} で分析中..."):
-                    res = scoring.llm_review(j, config)
-                if res["ok"]:
-                    allj = store.load_jobs()
-                    for x in allj:
-                        if x.id == j.id:
-                            x.llm_analysis = res["text"]
-                    store.save_jobs(allj)
-                    st.markdown(res["text"])
-                else:
-                    st.error(f"分析できませんでした: {res['error']}")
-                    st.caption("👇 下のプロンプトをコピーして、Claudeや他のLLMに貼り付けても分析できます")
-                    st.code(res["prompt"], language="markdown")
-            if j.llm_analysis:
-                with st.expander("保存済みLLM分析"):
-                    st.markdown(j.llm_analysis)
+    st.divider()
+    st.subheader("LLM設定（深掘り分析）")
+    llm_cfg = config.setdefault("llm", {})
+    c1, c2 = st.columns(2)
+    llm_cfg["provider"] = c1.selectbox("推論方法", ["ollama", "prompt-only"],
+                                       index=0 if llm_cfg.get("provider", "ollama") == "ollama" else 1)
+    llm_cfg["base_url"] = c2.text_input("Ollama base_url", value=llm_cfg.get("base_url", "http://localhost:11434"))
+    llm_cfg["timeout"] = st.number_input("タイムアウト(秒)", 10, 600, int(llm_cfg.get("timeout", 180)), 10)
+    if st.button("🔌 接続テスト / モデル一覧"):
+        st.session_state.llm_diag = scoring.ollama_diagnose(config)
+    diag = st.session_state.get("llm_diag")
+    _models = diag["models"] if diag else []
+    if diag:
+        (st.success if diag["ok"] else st.error)(diag["message"])
+    cur_model = llm_cfg.get("model", "qwen2.5:7b")
+    if _models:
+        llm_cfg["model"] = st.selectbox("モデル", _models,
+                                        index=_models.index(cur_model) if cur_model in _models else 0)
+    else:
+        llm_cfg["model"] = st.text_input("モデル名", value=cur_model)
+
+    # LLM設定を変更したら自動で config.toml に保存（再起動しても戻らない）
+    _llm_sig = (llm_cfg.get("provider"), llm_cfg.get("model"),
+                llm_cfg.get("base_url"), llm_cfg.get("timeout"))
+    if st.session_state.get("_llm_sig") != _llm_sig:
+        try:
+            save_llm_config(llm_cfg)
+            st.session_state["_llm_sig"] = _llm_sig
+            st.caption("✅ LLM設定を保存しました")
+        except Exception as e:  # noqa: BLE001
+            st.warning(f"LLM設定の保存に失敗: {e}")
+
+    st.divider()
+    st.subheader("採点の重み")
+    st.caption("スライダーを動かすと即再採点されます（合計が100でなくても自動正規化）。")
+    sc = config.setdefault("scoring", {})
+    wc = st.columns(4)
+    sc["weight_keyword"] = wc[0].slider("キーワード", 0, 100, int(sc.get("weight_keyword", 45)), 5)
+    sc["weight_rate"] = wc[1].slider("単価", 0, 100, int(sc.get("weight_rate", 25)), 5)
+    sc["weight_remote"] = wc[2].slider("リモート", 0, 100, int(sc.get("weight_remote", 15)), 5)
+    sc["weight_freshness"] = wc[3].slider("新着", 0, 100, int(sc.get("weight_freshness", 15)), 5)
+    if st.button("💾 重みを保存（config.toml）"):
+        try:
+            save_scoring_weights({k: sc[k] for k in ("weight_keyword", "weight_rate", "weight_remote", "weight_freshness")})
+            st.success("保存しました")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"保存失敗: {e}")
 
 # ---------------- 取り込み ----------------
 with tab_import:
     st.subheader("Chrome連携 / 手動で案件を取り込む")
-    st.caption(
-        "ログイン必須・SPAのサイト(レバテック/Findy等)は自動取得が難しいため、"
-        "Claude in Chrome でページから案件を抜き出してJSONで貼り付けるか、手動で1件追加できます。"
-    )
-    src_key = st.selectbox(
-        "取り込み先エージェント",
-        options=[s.key for s in SOURCES],
-        format_func=lambda k: SOURCE_BY_KEY[k].name,
-    )
-
+    src_key = st.selectbox("取り込み先エージェント", options=[s.key for s in SOURCES],
+                           format_func=lambda k: SOURCE_BY_KEY[k].name)
     st.markdown("**A) JSON(records)で一括取り込み**")
-    st.code(
-        '[\n  {"title":"生成AIエージェント基盤の開発","company":"X社",\n'
-        '   "url":"https://...","rate_text":"〜120万円/月","work_style":"フルリモート 週4",\n'
-        '   "description":"...","posted_date":"2026-06-25"}\n]',
-        language="json",
-    )
-    json_text = st.text_area("JSONを貼り付け", height=180, key="json_in")
+    st.code('[\n  {"title":"...","company":"X社","url":"https://...",\n'
+            '   "rate_text":"〜120万円/月","work_style":"フルリモート 週4",\n'
+            '   "description":"...","posted_date":"2026-06-25"}\n]', language="json")
+    json_text = st.text_area("JSONを貼り付け", height=160, key="json_in")
     if st.button("JSONを取り込む"):
         try:
             data = json.loads(json_text)
@@ -371,7 +312,6 @@ with tab_import:
             st.success(f"取り込み完了: 新規 {a} / 更新 {u}")
         except Exception as e:  # noqa: BLE001
             st.error(f"取り込み失敗: {e}")
-
     st.divider()
     st.markdown("**B) 手動で1件追加**")
     with st.form("manual_add"):
@@ -381,19 +321,15 @@ with tab_import:
         m_rate = st.text_input("単価表記 (例: 〜120万円/月, 8000円/時)")
         m_style = st.text_input("働き方 (例: フルリモート 週3)")
         m_date = st.text_input("掲載日 (YYYY-MM-DD)")
-        m_desc = st.text_area("案件説明", height=140)
-        submitted = st.form_submit_button("追加")
-        if submitted:
+        m_desc = st.text_area("案件説明", height=120)
+        if st.form_submit_button("追加"):
             if not m_title.strip():
                 st.error("タイトルは必須です")
             else:
-                a, u = ingest.ingest_single(
-                    src_key, title=m_title, company=m_company, url=m_url,
-                    rate_text=m_rate, work_style=m_style, posted_date=m_date,
-                    description=m_desc,
-                )
+                a, u = ingest.ingest_single(src_key, title=m_title, company=m_company, url=m_url,
+                                            rate_text=m_rate, work_style=m_style, posted_date=m_date,
+                                            description=m_desc)
                 st.success(f"追加完了: 新規 {a} / 更新 {u}")
-
     st.divider()
     if st.button("⚠ 全案件データをクリア"):
         store.clear_jobs()
@@ -404,17 +340,260 @@ with tab_help:
     st.markdown(
         """
 ### 使い方
-1. **左サイドバーでエージェントをON/OFF** — 調べたいサイトだけ有効化（設定は `config.toml` に保存）。
-2. **キーワード/フィルタ** を設定。
-3. **「自動取得」** で公開ページをベストエフォート取得。ログイン必須サイトは「取り込み」タブへ。
-4. **マッチ率(ルール)** 降順で一覧表示。内訳(KW/単価/リモート/新着)も確認可。
-5. 気になる案件は **「LLM深掘り分析」** (ローカルOllama) で適合度・単価妥当性・提案ドラフトを生成。
+1. **⚙️設定**タブで取得元エージェントをON/OFF、LLMを設定。
+2. サイドバーの **🌐/🔄 取得** で案件を取り込み（要ログインサイトは `python fetch_browser.py --login`）。
+3. **📋案件一覧**でマッチ率順に表示。サイドバー＝よく使う絞り込み、**🎛絞り込み詳細**＝NGワード/提供元/エリア/時給。
+4. 各案件で **ステータス**（気になる/応募済み/見送り）を設定。見送りは既定で非表示。
+5. **🆕** は初観測が新しい案件、**⚠️** は最新取得で確認できず（受付終了の可能性）。
+6. 気になる案件は **🤖LLM深掘り分析**（ローカルOllama）。
 
-### マッチ率の算出
-- ルール採点 = キーワード一致 + 単価適合 + リモート/働き方 + 新着度（重みは `config.toml [scoring]`）。
-- LLM深掘りは選んだ案件のみ。プライバシー重視ならローカルOllamaで完結。
-
-### Chrome連携の流れ
-レバテック等は Claude in Chrome で検索結果を開き、案件を上記JSON形式に整形 → 「取り込み」タブに貼り付け。
+### マッチ率
+ルール採点 = キーワード一致 + 単価 + リモート/働き方 + 新着度（重みは `config.toml [scoring]`）。
         """
     )
+
+# ================= 共有データセット（サマリー/一覧で共用） =================
+active = enabled_sources(config)
+active_keys = {s.key for s in active}
+_base = [j for j in store.load_jobs() if j.source in active_keys]
+_base = [j for j in _base if job_provider(j) not in exclude_providers]
+
+
+def _ng_hit(j) -> bool:
+    if not ng_words:
+        return False
+    hay = " ".join([j.title, j.company, j.description, job_provider(j)]).lower()
+    return any(w.lower() in hay for w in ng_words)
+
+
+ng_removed = sum(1 for j in _base if _ng_hit(j))
+_base = [j for j in _base if not _ng_hit(j)]
+_base = scoring.score_jobs(_base, config)
+
+
+def _passes(j):
+    if (j.score or 0) < min_score:
+        return False
+    if status_set and _job_status(j) not in status_set:
+        return False
+    if hide_stale and j.stale:
+        return False
+    if remote_set and job_remote_level(j) not in remote_set:
+        return False
+    if days_filter:
+        ds = days_set(j)
+        if ds and not (ds & days_filter):
+            return False
+        if not ds and not include_unknown_days:
+            return False
+    if pref_set:
+        pf = job_prefecture(j)
+        if pf and pf not in pref_set:
+            return False
+        if not pf and not include_unknown_area:
+            return False
+    if min_hourly:
+        hi = j.rate_hourly_max or ((j.rate_monthly_max or 0) // 160)
+        if hi and hi < min_hourly:
+            return False
+    return True
+
+
+shown = [j for j in _base if _passes(j)]
+
+_SORTS = {
+    "マッチ率（高い順）": lambda L: L.sort(key=lambda j: (j.score or 0), reverse=True),
+    "単価（高い順）": lambda L: L.sort(key=lambda j: (_monthly(j), j.score or 0), reverse=True),
+    "単価（低い順）": lambda L: L.sort(key=lambda j: (_monthly(j) if _monthly(j) else 10**12, -(j.score or 0))),
+    "新着順（初観測）": lambda L: L.sort(key=lambda j: (j.first_seen or "", j.score or 0), reverse=True),
+    "取得元（エージェント）別": lambda L: L.sort(key=lambda j: (j.source_name, -(j.score or 0))),
+    "提供元別": lambda L: L.sort(key=lambda j: (job_provider(j) or "～", -(j.score or 0))),
+}
+_SORTS.get(sort_opt, _SORTS["マッチ率（高い順）"])(shown)
+
+
+def render_card(j, dup_group=None):
+    score = j.score or 0
+    color = "🟢" if score >= 70 else ("🟡" if score >= 45 else "⚪")
+    prov = job_provider(j)
+    rate_disp = j.rate_text or "単価記載なし"
+    fage = _days_ago(j.first_seen)
+    status_label = {"気になる": "⭐気になる", "応募済み": "✅応募済み", "見送り": "🚫見送り"}.get(j.status, "")
+    new_label = "🆕NEW" if (fage is not None and fage <= 2) else ""
+    stale_label = "⚠️終了?" if j.stale else ""
+    dup_label = f"🔁重複{len(dup_group)}件" if (dup_group and len(dup_group) > 1) else ""
+    tags = "　".join(t for t in [new_label, stale_label, dup_label, status_label] if t)
+    tags = f"〔{tags}〕 " if tags else ""
+    header = (f"{color} **{score:.0f}%**  ｜ 💰 **{rate_disp}**  ｜ {tags}{j.title}  "
+              f"｜ _{j.source_name}_ / 提供元:_{prov or '—'}_")
+    with st.expander(header):
+        fresh = []
+        if fage is not None:
+            fresh.append(f"初観測: {fage}日前")
+        lage = _days_ago(j.last_seen)
+        if lage is not None:
+            fresh.append(f"最終確認: {lage}日前")
+        if j.posted_date:
+            fresh.append(f"掲載: {j.posted_date}")
+        if j.stale:
+            fresh.append("⚠️ 最新取得に無し（受付終了の可能性）")
+        if fresh:
+            st.caption("　｜　".join(fresh))
+
+        # 重複（名寄せ）：各ソースの単価・提供元を並記（一次ソース優先で代表表示）
+        if dup_group and len(dup_group) > 1:
+            st.markdown("**🔁 同一とみられる案件（一次ソース優先）**")
+            for d in dup_group:
+                star = "★" if d is j else "・"
+                st.markdown(
+                    f"{star} {d.source_name} / 提供元:{job_provider(d) or '—'} ｜ "
+                    f"単価:{d.rate_text or '—'} ｜ " + (f"[開く ↗]({d.url})" if d.url else "")
+                )
+            st.caption("★＝代表（一次ソース）。単価が異なる場合は中抜き等の可能性。")
+
+        meta = []
+        if prov:
+            meta.append(f"提供元: {prov}")
+        if j.rate_text:
+            meta.append(f"単価: {j.rate_text}")
+        if j.work_style:
+            meta.append(f"働き方: {j.work_style}")
+        meta.append(f"リモート区分: {job_remote_level(j)}")
+        meta.append(f"稼働日数: {days_label(j)}")
+        meta.append(f"エリア: {job_prefecture(j) or '不明/記載なし'}")
+        st.caption("　｜　".join(meta))
+
+        sc1, sc2 = st.columns([1, 2])
+        cur_status = _job_status(j)
+        new_status = sc1.selectbox("ステータス", STATUS_OPTIONS,
+                                   index=STATUS_OPTIONS.index(cur_status), key=f"st_{j.id}")
+        if new_status != cur_status:
+            _set_status(j.id, new_status)
+            st.rerun()
+        note_val = sc2.text_input("メモ", value=j.notes, key=f"note_{j.id}")
+        if note_val != j.notes:
+            _set_notes(j.id, note_val)
+
+        bd = j.score_breakdown or {}
+        if bd:
+            bc = st.columns(4)
+            bc[0].metric("KW一致", f"{bd.get('keyword',0):.0f}")
+            bc[1].metric("単価", f"{bd.get('rate',0):.0f}")
+            bc[2].metric("リモート", f"{bd.get('remote',0):.0f}")
+            bc[3].metric("新着", f"{bd.get('freshness',0):.0f}")
+
+        if j.skills:
+            st.write("スキル: " + ", ".join(j.skills))
+        if j.url:
+            st.markdown(f"[案件ページを開く ↗]({j.url})")
+        if j.description:
+            with st.expander("案件説明"):
+                st.write(j.description[:4000])
+
+        mdl = config.get("llm", {}).get("model", "")
+        if st.button(f"🤖 LLM深掘り分析（{mdl or 'モデル未設定'}）", key=f"llm_{j.id}"):
+            with st.spinner(f"{mdl} で分析中..."):
+                res = scoring.llm_review(j, config)
+            if res["ok"]:
+                allj = store.load_jobs()
+                for x in allj:
+                    if x.id == j.id:
+                        x.llm_analysis = res["text"]
+                store.save_jobs(allj)
+                st.markdown(res["text"])
+            else:
+                st.error(f"分析できませんでした: {res['error']}")
+                st.caption("👇 プロンプトをコピーして他のLLMに投げてもOK")
+                st.code(res["prompt"], language="markdown")
+        if j.llm_analysis:
+            with st.expander("保存済みLLM分析"):
+                st.markdown(j.llm_analysis)
+
+
+# ---------------- サマリー ----------------
+with tab_summary:
+    if not shown:
+        st.info("表示対象がありません。取得・絞り込みを確認してください。")
+    else:
+        import pandas as pd
+        from collections import Counter
+        st.subheader(f"サマリー（表示中 {len(shown)}件）")
+        g1, g2 = st.columns(2)
+        with g1:
+            st.caption("取得元（エージェント）別 件数")
+            st.bar_chart(pd.Series(Counter(j.source_name for j in shown)).sort_values(ascending=False))
+            st.caption("リモート区分")
+            st.bar_chart(pd.Series(Counter(job_remote_level(j) for j in shown)))
+        with g2:
+            st.caption("単価分布（月額・万円）")
+            buckets = ["~50", "50-80", "80-100", "100-150", "150~", "不明"]
+            bc = Counter()
+            for j in shown:
+                m = _monthly(j) // 10000
+                if m <= 0:
+                    bc["不明"] += 1
+                elif m < 50:
+                    bc["~50"] += 1
+                elif m < 80:
+                    bc["50-80"] += 1
+                elif m < 100:
+                    bc["80-100"] += 1
+                elif m < 150:
+                    bc["100-150"] += 1
+                else:
+                    bc["150~"] += 1
+            st.bar_chart(pd.Series({b: bc.get(b, 0) for b in buckets}))
+            st.caption("エリア（都道府県・上位）")
+            pref_counts = Counter(job_prefecture(j) or "不明" for j in shown)
+            st.bar_chart(pd.Series(dict(pref_counts.most_common(10))))
+
+# ---------------- 案件一覧 ----------------
+with tab_jobs:
+    st.caption("有効エージェント: " + (", ".join(s.name for s in active) if active else "なし")
+               + f"　／　キーワード: {' '.join(keywords) if keywords else '(なし)'}")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("表示件数", len(shown))
+    c2.metric("全件(有効サイト)", len(_base))
+    c3.metric("平均マッチ率", f"{(sum(j.score or 0 for j in shown)/len(shown)):.0f}" if shown else "—")
+    c4.metric("NG除外", ng_removed)
+    if exclude_providers:
+        st.caption("除外中の提供元: " + ", ".join(sorted(exclude_providers)))
+
+    # 一括LLM分析（「気になる」上位N件）
+    with st.expander("🤖 気になる案件を一括LLM分析"):
+        kininaru = [j for j in shown if j.status == "気になる"]
+        st.caption(f"「気になる」: {len(kininaru)}件。上位N件を順に深掘り分析します（詳細ページ取得＋Ollama）。")
+        cA, cB = st.columns([1, 1])
+        topn = cA.number_input("件数N", 1, 20, min(5, max(1, len(kininaru))))
+        enrich = cB.checkbox("詳細ページも取得して精度UP", value=True)
+        if st.button("一括分析を実行", disabled=not kininaru):
+            targets = kininaru[:int(topn)]
+            prog = st.progress(0.0)
+            allj = store.load_jobs()
+            by_id = {x.id: x for x in allj}
+            done = 0
+            for i, j in enumerate(targets):
+                if enrich and j.url and not j.description:
+                    txt = fetcher.fetch_detail_text(j.url)
+                    if txt:
+                        j.description = (j.description + "\n" + txt)[:4000]
+                res = scoring.llm_review(j, config)
+                if res["ok"]:
+                    if j.id in by_id:
+                        by_id[j.id].llm_analysis = res["text"]
+                    done += 1
+                prog.progress((i + 1) / len(targets))
+            store.save_jobs(allj)
+            st.success(f"完了: {done}/{len(targets)} 件を分析・保存しました（各案件の『保存済みLLM分析』に表示）")
+
+    if not shown:
+        st.info("該当案件がありません。サイドバーで取得するか、絞り込み条件をゆるめてください。")
+    elif dedup_on:
+        groups = dedup.group_duplicates(shown)
+        st.caption(f"名寄せ: {len(shown)}件 → {len(groups)}グループ")
+        for g in groups:
+            render_card(g[0], dup_group=g)
+    else:
+        for j in shown:
+            render_card(j)
