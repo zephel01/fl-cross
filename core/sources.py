@@ -49,12 +49,14 @@ SOURCES: list[Source] = [
         type="Aggregator",
         priority=1,
         base_url="https://freelance-hub.jp/",
-        search_url="https://freelance-hub.jp/project/search/",
-        build_search=lambda kw: f"https://freelance-hub.jp/project/search/?keyword={_plus(kw)}",
+        search_url="https://freelance-hub.jp/project/",
+        # キーワードはAND検索で多語だと0件になるため、他ソース同様に一覧を取得し
+        # 関連度は fl-cross 側の採点に委ねる（おすすめ順の新着40件/ページ）。
+        build_search=lambda kw: "https://freelance-hub.jp/project/",
         login_required=False,
         js_required=False,
         parser_key="freelance_hub",
-        note="36万件超のアグリゲーター。NuxtのSSRで生HTMLに案件(ProjectCard)が入るためhttpx取得可。提供元(エージェント名)も取得",
+        note="36万件超のアグリゲーター。NuxtのSSRで生HTMLに案件(ProjectCard)が入るためhttpx取得可。提供元(エージェント名)も取得。一覧取得＋ローカル採点",
     ),
     Source(
         key="levtech",
