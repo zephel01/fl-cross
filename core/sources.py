@@ -52,9 +52,9 @@ SOURCES: list[Source] = [
         search_url="https://freelance-hub.jp/project/search/",
         build_search=lambda kw: f"https://freelance-hub.jp/project/search/?keyword={_plus(kw)}",
         login_required=False,
-        js_required=True,
+        js_required=False,
         parser_key="freelance_hub",
-        note="36万件超のアグリゲーター。Vue製SPAでhttpx自動取得は不可→Chrome連携で取得",
+        note="36万件超のアグリゲーター。NuxtのSSRで生HTMLに案件(ProjectCard)が入るためhttpx取得可。提供元(エージェント名)も取得",
     ),
     Source(
         key="levtech",
