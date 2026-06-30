@@ -207,6 +207,54 @@ def _p_engineer_factory(html: str, s: Source):
     return _card_parse(html, s, r"/freelance/jobs/\d")
 
 
+def _p_freelance_hub(html: str, s: Source):
+    """フリーランスHub専用パーサ（Nuxt SSR）。
+
+    案件は <div class="ProjectCard" id="ProjectListPc_ProjectCard_{id}"> として
+    生HTMLに含まれる。タイトル・単価・提供元(エージェント名)・職種等をカード単位で抽出。
+    """
+    import re as _re
+    soup = _soup(html)
+    YEN = _re.compile(r"[\d,]+(?:\s*[〜～~]\s*[\d,]+)?\s*万?\s*円(?:\s*[/／]?\s*月)?")
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    cards = soup.find_all("div", class_="ProjectCard")
+    for card in cards:
+        cid = ""
+        m = _re.search(r"(\d{3,})", card.get("id") or "")
+        if m:
+            cid = m.group(1)
+        title_el = card.find(class_="ProjectCard_Title")
+        title = (title_el.get_text(strip=True) if title_el else "")
+        if len(title) < 6:
+            continue
+        if cid and cid in seen:
+            continue
+        text = card.get_text(" ", strip=True)
+        rate_m = YEN.search(text)
+        # 提供元（エージェント名）
+        company = ""
+        prov = card.find(class_="ProjectCard__Footer__Info")
+        prov_text = prov.get_text(" ", strip=True) if prov else text
+        pm = _re.search(r"提供元[:：]\s*(.+?)\s*$", prov_text)
+        if pm:
+            company = pm.group(1).strip()
+        # 説明
+        det = card.find(class_="ProjectCard_DetailText")
+        desc = det.get_text(" ", strip=True) if det else title
+        url = f"{s.base_url.rstrip('/')}/project/detail/{cid}/" if cid else s.base_url
+        if cid:
+            seen.add(cid)
+        records.append({
+            "title": title[:120],
+            "url": url,
+            "company": company,
+            "rate_text": rate_m.group(0) if rate_m else "",
+            "description": (title + " / " + desc)[:300],
+        })
+    return records
+
+
 # サイト別パーサ（未登録キーは汎用にフォールバック）
 PARSERS: dict[str, Callable[[str, Source], list[dict[str, Any]]]] = {
     "itpropartners": _p_itpropartners,
@@ -216,6 +264,7 @@ PARSERS: dict[str, Callable[[str, Source], list[dict[str, Any]]]] = {
     "geechs": _p_geechs,
     "techstock": _p_techstock,
     "engineer_factory": _p_engineer_factory,
+    "freelance_hub": _p_freelance_hub,
 }
 
 
