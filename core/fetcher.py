@@ -191,12 +191,27 @@ def _p_pebank(html: str, s: Source):
     return _card_parse(html, s, r"/(java|other|sap|infra|php|python|ruby|web|network|pm|cloud|mobile|sier|game|ai)/\d")
 
 
+def _p_geechs(html: str, s: Source):
+    return _card_parse(html, s, r"/project/details/\d")
+
+
+def _p_techstock(html: str, s: Source):
+    return _card_parse(html, s, r"/projects/details/\d")
+
+
+def _p_engineer_factory(html: str, s: Source):
+    return _card_parse(html, s, r"/freelance/jobs/\d")
+
+
 # サイト別パーサ（未登録キーは汎用にフォールバック）
 PARSERS: dict[str, Callable[[str, Source], list[dict[str, Any]]]] = {
     "itpropartners": _p_itpropartners,
     "midworks": _p_midworks,
     "techfree": _p_techfree,
     "pebank": _p_pebank,
+    "geechs": _p_geechs,
+    "techstock": _p_techstock,
+    "engineer_factory": _p_engineer_factory,
 }
 
 
