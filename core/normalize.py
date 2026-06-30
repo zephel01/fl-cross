@@ -24,8 +24,15 @@ def _to_int(s: str) -> Optional[int]:
         return None
 
 
-def parse_rate(text: str) -> dict[str, Any]:
-    """単価表記から hourly/monthly レンジを推定して返す。"""
+def parse_rate(text: str, bare_yen_monthly: bool = True) -> dict[str, Any]:
+    """単価表記から hourly/monthly レンジを推定して返す。
+
+    bare_yen_monthly:
+      6〜7桁の「素の円」(例: "1,210,000 円") を月額とみなすか。
+      エージェントの単価表記は月額が基本なので既定True。
+      クラウドソーシング(ランサーズ等)はプロジェクト総額(一括)の場合が多いため
+      False を渡し、「月」表記がある時だけ月額採用＝総額の取り込みを防ぐ。
+    """
     out: dict[str, Any] = {"rate_text": text.strip() if text else ""}
     if not text:
         return out
@@ -39,6 +46,15 @@ def parse_rate(text: str) -> dict[str, Any]:
         out["rate_hourly_max"] = nums[-1]
         return out
 
+    # 月額（万円）レンジ: 単位を後ろに共有する "60〜90万", "月額 46 ～ 50 万円" 等
+    # （下限側に万が無いケースを取りこぼさない）
+    man_range = re.search(r"(\d{2,4})\s*万?\s*[〜～~\-―ー－]\s*(\d{2,4})\s*万", t)
+    if man_range:
+        lo, hi = sorted((int(man_range.group(1)), int(man_range.group(2))))
+        out["rate_monthly_min"] = lo * 10000
+        out["rate_monthly_max"] = hi * 10000
+        return out
+
     # 月額（万円）
     man_nums = re.findall(r"(\d{2,4})\s*万", t)
     if man_nums:
@@ -47,12 +63,15 @@ def parse_rate(text: str) -> dict[str, Any]:
         out["rate_monthly_max"] = nums[-1]
         return out
 
-    # 月額（円, 6-7桁）
-    big = re.findall(r"(\d{6,7})", t)
-    if big:
-        nums = sorted(int(n) for n in big)
-        out["rate_monthly_min"] = nums[0]
-        out["rate_monthly_max"] = nums[-1]
+    # 月額（円, 6-7桁）。エージェントは月額が基本なので採用。
+    # クラウドソーシング(bare_yen_monthly=False)では「月」表記がある時のみ採用し、
+    # プロジェクト総額(一括)を月額として取り込まないようにする。
+    if bare_yen_monthly or "月" in t:
+        big = re.findall(r"(\d{6,7})", t)
+        if big:
+            nums = sorted(int(n) for n in big)
+            out["rate_monthly_min"] = nums[0]
+            out["rate_monthly_max"] = nums[-1]
     return out
 
 
@@ -105,7 +124,9 @@ def normalize(
     from .workdays import parse_days
     src = SOURCE_BY_KEY.get(source_key)
     source_name = src.name if src else source_key
-    rate = parse_rate(rate_text or "")
+    # クラウドソーシング(ランサーズ等)は素の円が総額の場合が多いので月額断定しない。
+    is_crowdsourcing = bool(src and getattr(src, "type", "") == "Cloud Sourcing")
+    rate = parse_rate(rate_text or "", bare_yen_monthly=not is_crowdsourcing)
     body = " ".join([title, description, work_style])
     area_body = " ".join([location, work_style, description, title])
     d_lo, d_hi = parse_days(body)
