@@ -127,7 +127,11 @@ def _card_parse(html: str, source: Source, link_re: str, *, title_from_heading: 
     """詳細リンク起点でカードを特定し title/rate/work_style を抽出する共通パーサ。"""
     import re as _re
     soup = _soup(html)
-    YEN = _re.compile(r"[\d,]+\s*万?\s*円")
+    # 末尾の「/月」「月」表記も取り込み、月額か否か(=総額)の判定材料を残す。
+    YEN = _re.compile(r"[\d,]+\s*万?\s*円(?:\s*[/／]?\s*月)?")
+    # 単位を後ろに共有するレンジ表記（例: "60 〜 90 万円", "月額 46 ～ 50 万円"）を
+    # 1トークンとして拾い、下限が欠落しないようにする。
+    RANGE = _re.compile(r"[\d,]+\s*万?\s*[〜～~\-―ー－]\s*[\d,]+\s*万\s*円(?:\s*[/／]?\s*月)?")
     pat = _re.compile(link_re)
     records: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -158,7 +162,7 @@ def _card_parse(html: str, source: Source, link_re: str, *, title_from_heading: 
                 title = h.get_text(strip=True)
         if len(title) < 6:
             continue
-        rate_m = YEN.search(text)
+        rate_m = RANGE.search(text) or YEN.search(text)
         full = href if href.startswith("http") else source.base_url.rstrip("/") + "/" + href.lstrip("/")
         remote = "リモート" in text or "在宅" in text
         week_m = _re.search(r"週\s*([1-5])", text)
