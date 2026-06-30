@@ -75,3 +75,9 @@ enabled = true
 enabled = true
 [agents.flexy]
 enabled = true
+[agents.geechs]
+enabled = true
+[agents.techstock]
+enabled = true
+[agents.engineer_factory]
+enabled = true
