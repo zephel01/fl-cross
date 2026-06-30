@@ -147,6 +147,31 @@ exclude_microtasks = st.sidebar.checkbox(
 st.sidebar.divider()
 st.sidebar.subheader("取得")
 pw_ok = _bf._is_playwright_available()
+
+if st.sidebar.button("🚀 全取得（自動振り分け）", use_container_width=True, type="primary",
+                     help="静的サイトはhttpx、JS/ログイン必須サイトはブラウザへ自動で振り分けて一括取得"):
+    with st.spinner("取得中…（静的→httpx / JS・ログイン→ブラウザ）"):
+        msgs, ta, tu = [], 0, 0
+        # 1) 静的サイト = httpx（fetch_all は js/login を自動スキップ）
+        for r in fetcher.fetch_all(config, keywords):
+            if r.jobs:
+                a, u = store.upsert_jobs(r.jobs)
+                ta += a
+                tu += u
+            msgs.append(f"- {r.source.name}: {r.message}")
+        # 2) JS/ログイン必須サイト = ブラウザ（Playwright があれば）
+        need_browser = [s for s in enabled_sources(config) if s.js_required or s.login_required]
+        if need_browser and pw_ok:
+            proc = subprocess.run([_sys.executable, "fetch_browser.py", "--keywords", *keywords],
+                                  cwd=str(Path(__file__).parent), capture_output=True, text=True, timeout=600)
+            st.session_state.browser_log = (proc.stdout or "") + (proc.stderr or "")
+            msgs.append(f"- ブラウザ取得: {', '.join(s.name for s in need_browser)}（ログ参照）")
+        elif need_browser:
+            msgs.append("- ⚠ JS/ログイン必須サイトは Playwright 未導入のためスキップ（下のブラウザ取得を参照）")
+        st.session_state.fetch_report = msgs
+        st.session_state.fetch_summary = f"新規 {ta} / 更新 {tu}（httpx分）"
+    st.rerun()
+
 if st.sidebar.button("🌐 全サイト自動取得（ブラウザ）", use_container_width=True, disabled=not pw_ok,
                      help="Playwrightで全有効サイト(SPA/ログイン含む)を取得"):
     with st.spinner("ブラウザで全サイト取得中…（30〜90秒）"):
@@ -370,7 +395,10 @@ with tab_help:
 # ================= 共有データセット（サマリー/一覧で共用） =================
 active = enabled_sources(config)
 active_keys = {s.key for s in active}
-_base = [j for j in store.load_jobs() if j.source in active_keys]
+_all_jobs = store.load_jobs()
+if store.LAST_LOAD_WARNING:
+    st.warning("⚠ " + store.LAST_LOAD_WARNING)
+_base = [j for j in _all_jobs if j.source in active_keys]
 _base = [j for j in _base if job_provider(j) not in exclude_providers]
 
 

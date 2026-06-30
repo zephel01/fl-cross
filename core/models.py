@@ -4,6 +4,28 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
+from urllib.parse import urlsplit, urlunsplit
+
+
+def normalize_url(url: str) -> str:
+    """ID安定化用のURL正規化。
+
+    - クエリ/フラグメント（?utm=... や #... 等のトラッキング）を除去
+    - スキーム/ホストを小文字化
+    - 末尾スラッシュを除去
+    同一案件が表記差で別IDに割れるのを防ぐ。
+    """
+    u = (url or "").strip()
+    if not u:
+        return ""
+    try:
+        parts = urlsplit(u)
+        if not parts.scheme and not parts.netloc:
+            return u.rstrip("/")
+        path = parts.path.rstrip("/") or "/"
+        return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, "", ""))
+    except Exception:  # noqa: BLE001
+        return u.rstrip("/")
 
 
 @dataclass
@@ -47,8 +69,12 @@ class Job:
 
     @property
     def id(self) -> str:
-        """URL優先、無ければ source+title でハッシュ化した安定ID。"""
-        basis = self.url.strip() or f"{self.source}:{self.title}"
+        """URL優先、無ければ source+title でハッシュ化した安定ID。
+
+        URLはトラッキング除去等で正規化してから用いるため、?utm= や末尾スラッシュ
+        の差で同一案件が別IDに割れない。
+        """
+        basis = normalize_url(self.url) or f"{self.source}:{self.title}"
         return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
 
     def to_dict(self) -> dict[str, Any]:

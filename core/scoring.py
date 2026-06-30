@@ -24,6 +24,22 @@ def _norm(s: str) -> str:
     return (s or "").lower()
 
 
+_ASCII_KW = re.compile(r"^[a-z0-9.+#/-]+$")
+
+
+def _kw_hit(k: str, haystack: str) -> bool:
+    """キーワード一致判定（haystack は小文字化済み前提）。
+
+    英数字のみの短い語（AI, Go, C# 等）は前後が英数字でない境界一致にして、
+    'available' 内の 'ai' のような誤ヒットを防ぐ。日本語は従来どおり部分一致。
+    """
+    if not k:
+        return False
+    if _ASCII_KW.match(k):
+        return re.search(r"(?<![a-z0-9])" + re.escape(k) + r"(?![a-z0-9])", haystack) is not None
+    return k in haystack
+
+
 def _keyword_score(job: Job, keywords: list[str]) -> float:
     """説明・タイトル・スキルに含まれる強みKWの割合 (0..1)。"""
     if not keywords:
@@ -32,7 +48,7 @@ def _keyword_score(job: Job, keywords: list[str]) -> float:
     hits = 0
     for kw in keywords:
         k = _norm(kw)
-        if k and k in haystack:
+        if _kw_hit(k, haystack):
             hits += 1
     # 重なり数を対数的に評価（多すぎると飽和）。3個一致で~0.6、6個で~0.85目安。
     ratio = hits / max(len(keywords), 1)
@@ -106,7 +122,8 @@ def _parse_date(s: str) -> Optional[date]:
 
 def _freshness_score(job: Job, today: Optional[date] = None) -> float:
     today = today or date.today()
-    d = _parse_date(job.posted_date)
+    # 掲載日が取れないサイトが多いので、無ければ first_seen（当方の初観測日）を新着の代理に使う
+    d = _parse_date(job.posted_date) or _parse_date(getattr(job, "first_seen", ""))
     if not d:
         return 0.5  # 不明は中立
     days = (today - d).days

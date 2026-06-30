@@ -8,6 +8,7 @@ env/
 # 個人設定・実データ（コミットしない）
 config.toml
 data/jobs.json
+data/backups/
 .fl-cross/
 
 # OS / editor
